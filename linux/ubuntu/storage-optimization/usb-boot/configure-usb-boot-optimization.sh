@@ -12,18 +12,21 @@
 #          unnecessary background writes.
 #
 # What the script does:
-#   1. Detects (or accepts) the parent block device that backs
-#      the root filesystem.
-#   2. Disables APM / spindown via hdparm (skipped when the
-#      device does not support hdparm, e.g. plain USB sticks).
-#   3. Enables write caching on the device.
-#   4. Increases the read-ahead buffer to 4096 sectors.
-#   5. Adds noatime + commit=60 to the root fstab entry and
+#   1. Detects (or accepts) the underlying physical disk that
+#      backs the root filesystem -- walking through LVM,
+#      dm-crypt, and mdraid stacks down to the real disk.
+#   2. Classifies the disk (transport, rotational vs SSD, ATA
+#      vs non-ATA) and SKIPS steps that don't apply:
+#        * hdparm APM/spindown   -> only for rotational ATA
+#        * hdparm write-cache    -> only for ATA devices
+#        * read-ahead            -> always (applied to the
+#          physical disk AND any dm/LV layered on top)
+#   3. Adds noatime + commit=60 to the root fstab entry and
 #      mounts /tmp on tmpfs.
-#   6. Installs and enables zram-tools for compressed swap.
-#   7. Disables noisy background services (apport, whoopsie,
+#   4. Installs and enables zram-tools for compressed swap.
+#   5. Disables noisy background services (apport, whoopsie,
 #      motd-news).
-#   8. Applies VM writeback sysctl tuning to batch dirty-page
+#   6. Applies VM writeback sysctl tuning to batch dirty-page
 #      flushes.
 #
 # Detection / Idempotency:
@@ -122,26 +125,66 @@ fi
 # -------------------------------
 # Detect / confirm root device
 # -------------------------------
-detect_parent_device() {
-    local rootsrc parent
+# Walk dm-crypt / LVM / mdraid stacks down to the underlying physical disk(s).
+# Returns one '/dev/<diskname>' per line. For a single-disk root, that's one line.
+resolve_physical_disks() {
+    local src="$1"
+    [[ -z "$src" ]] && return 1
+    # lsblk -s gives the inverse tree (children -> parents). The TYPE=="disk"
+    # rows are the physical devices that back the given source.
+    lsblk -s -no NAME,TYPE "$src" 2>/dev/null \
+        | awk '$2 == "disk" {print "/dev/" $1}' \
+        | sort -u
+}
+
+detect_root_physical_disk() {
+    local rootsrc disks
     rootsrc="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
-    if [[ -z "$rootsrc" ]]; then
-        return 1
-    fi
-    # lsblk handles nvme/mmc/dm-crypt naming better than a sed pattern.
-    parent="$(lsblk -no PKNAME "$rootsrc" 2>/dev/null | head -n1)"
-    if [[ -n "$parent" ]]; then
-        printf '/dev/%s\n' "$parent"
-    else
-        # Already a whole disk (e.g. /dev/sda); return as-is.
+    [[ -z "$rootsrc" ]] && return 1
+    disks="$(resolve_physical_disks "$rootsrc" || true)"
+    if [[ -z "$disks" ]]; then
+        # Fallback: PKNAME (one level up). Handles oddball setups.
+        local parent
+        parent="$(lsblk -no PKNAME "$rootsrc" 2>/dev/null | head -n1)"
+        if [[ -n "$parent" ]]; then
+            printf '/dev/%s\n' "$parent"
+            return 0
+        fi
         printf '%s\n' "$rootsrc"
+        return 0
+    fi
+    # If the root is striped/RAID across multiple disks, take the first and warn.
+    local count
+    count="$(printf '%s\n' "$disks" | wc -l)"
+    if [[ "$count" -gt 1 ]]; then
+        echo "WARNING: root is backed by multiple physical disks:" >&2
+        printf '         %s\n' $disks >&2
+        echo "         Using the first one. Re-run with --device to target a specific disk." >&2
+    fi
+    printf '%s\n' "$disks" | head -n1
+}
+
+# Classify a physical disk so we only run tuning steps that make sense for it.
+# Sets the following globals:
+#   dev_transport  - usb|sata|nvme|mmc|virtio|...   (lsblk TRAN)
+#   dev_rotational - 1 (HDD) | 0 (SSD/flash)
+#   dev_is_ata     - 1 if hdparm -I succeeds (ATA command set works)
+classify_device() {
+    local d="$1"
+    dev_transport="$(lsblk -dno TRAN "$d" 2>/dev/null | tr -d ' ')"
+    [[ -z "$dev_transport" ]] && dev_transport="unknown"
+    dev_rotational="$(cat "/sys/block/$(basename "$d")/queue/rotational" 2>/dev/null || echo 0)"
+    if hdparm -I "$d" >/dev/null 2>&1; then
+        dev_is_ata=1
+    else
+        dev_is_ata=0
     fi
 }
 
 if [[ -z "$device" ]]; then
-    detected="$(detect_parent_device || true)"
+    detected="$(detect_root_physical_disk || true)"
     if [[ -z "$detected" ]]; then
-        echo "ERROR: Could not detect root parent device."
+        echo "ERROR: Could not detect root physical disk."
         exit 1
     fi
     if [[ "$noninteractive" == "1" ]]; then
@@ -151,11 +194,12 @@ if [[ -z "$device" ]]; then
         # Interactive prompt goes to the controlling terminal even though
         # stdout is redirected to the log.
         {
-            echo "Detected root device: $detected"
+            echo "Detected root physical disk: $detected"
+            lsblk -dpno NAME,TRAN,SIZE,MODEL "$detected" 2>/dev/null || true
             read -r -p "Use detected device ($detected)? [Y/n]: " reply
             if [[ "$reply" =~ ^[Nn]$ ]]; then
                 echo "Available block devices:"
-                lsblk -dpno NAME,SIZE,MODEL
+                lsblk -dpno NAME,TRAN,SIZE,MODEL
                 read -r -p "Enter device path (e.g., /dev/sda): " device
             else
                 device="$detected"
@@ -168,14 +212,38 @@ if [[ ! -b "$device" ]]; then
     echo "ERROR: '$device' is not a block device."
     exit 1
 fi
+
+# Refuse partitions / dm devices for the persistence steps -- they need a whole disk.
+devtype="$(lsblk -dno TYPE "$device" 2>/dev/null | tr -d ' ')"
+if [[ "$devtype" != "disk" ]]; then
+    echo "ERROR: '$device' is type '$devtype', not a whole disk."
+    echo "       Pass --device with the underlying physical disk (e.g. /dev/sda)."
+    exit 1
+fi
+
 devbase="$(basename "$device")"
-echo "Target device: $device (kernel name: $devbase)"
+classify_device "$device"
+echo "Target device   : $device (kernel name: $devbase)"
+echo "  transport     : $dev_transport"
+echo "  rotational    : $dev_rotational  (1=HDD, 0=SSD/flash)"
+echo "  ATA cmd set   : $([[ $dev_is_ata -eq 1 ]] && echo yes || echo no)"
+
+if [[ "$dev_transport" != "usb" ]]; then
+    echo "NOTE: detected transport is '$dev_transport', not 'usb'. Continuing,"
+    echo "      but this script is tuned specifically for USB-attached boot disks."
+fi
 
 # -------------------------------
-# 1. Disable HDD spindown (hdparm)
+# 1. Disable HDD spindown (hdparm) -- only meaningful for rotational ATA disks
 # -------------------------------
 echo "[1/7] Configuring hdparm (disable APM / spindown)..."
-if hdparm -I "$device" >/dev/null 2>&1; then
+if [[ "$dev_is_ata" -ne 1 ]]; then
+    echo "SKIP: $device does not respond to hdparm -I (non-ATA bridge, USB"
+    echo "      flash stick, NVMe, or virtual disk). APM/spindown not applicable."
+elif [[ "$dev_rotational" -ne 1 ]]; then
+    echo "SKIP: $device is non-rotational (SSD/flash). APM/spindown is a"
+    echo "      no-op on solid-state media."
+else
     cat > /etc/hdparm.conf <<EOF
 # Managed by bos-scripts-collection / configure-usb-boot-optimization.sh
 $device {
@@ -184,41 +252,80 @@ $device {
 }
 EOF
     if hdparm -B 255 -S 0 "$device" >/dev/null 2>&1; then
-        echo "hdparm APM/spindown applied."
+        echo "hdparm APM/spindown applied (and persisted in /etc/hdparm.conf)."
     else
-        echo "WARNING: hdparm -B/-S not accepted by $device. Continuing."
+        echo "WARNING: hdparm -B/-S not accepted by $device. /etc/hdparm.conf written anyway."
     fi
-else
-    echo "WARNING: $device does not respond to hdparm (likely a USB flash"
-    echo "         drive or non-ATA bridge). Skipping hdparm tuning."
 fi
 
 # -------------------------------
-# 2. Enable write caching
+# 2. Enable write caching -- only for ATA disks; modern USB sticks/NVMe handle this themselves
 # -------------------------------
 echo "[2/7] Enabling write caching..."
-if hdparm -W 1 "$device" >/dev/null 2>&1; then
+if [[ "$dev_is_ata" -ne 1 ]]; then
+    echo "SKIP: $device does not accept ATA write-cache commands (non-ATA"
+    echo "      bridge, USB flash, NVMe, or virtual disk). The kernel/firmware"
+    echo "      manages write caching for these devices already."
+elif hdparm -W 1 "$device" >/dev/null 2>&1; then
     cat > /etc/udev/rules.d/99-bos-writecache.rules <<EOF
 # Managed by bos-scripts-collection / configure-usb-boot-optimization.sh
-ACTION=="add", KERNEL=="$devbase", RUN+="/usr/sbin/hdparm -W1 $device"
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="$devbase", RUN+="/usr/sbin/hdparm -W1 $device"
 EOF
-    echo "Write caching enabled and persisted via udev."
+    echo "Write caching enabled and persisted via udev (keyed on $devbase)."
 else
-    echo "WARNING: Could not enable write cache via hdparm on $device. Skipping."
+    echo "WARNING: hdparm -W1 not accepted by $device. Skipping persistence."
 fi
 
 # -------------------------------
-# 3. Increase read-ahead
+# 3. Increase read-ahead -- always useful; apply to physical disk AND
+#    any dm/LV layered on top (read-ahead is per-bdev).
 # -------------------------------
 echo "[3/7] Setting read-ahead buffer to ${readahead} sectors..."
-if blockdev --setra "$readahead" "$device" >/dev/null 2>&1; then
-    cat > /etc/udev/rules.d/60-bos-readahead.rules <<EOF
+ra_targets=("$device")
+rootsrc="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+if [[ -n "$rootsrc" && "$rootsrc" != "$device" && -b "$rootsrc" ]]; then
+    ra_targets+=("$rootsrc")
+fi
+
+# udev rule: key on the physical disk's kernel name. dm/LV read-ahead is
+# re-applied at boot via a small systemd service (see below) since dm devices
+# don't get a stable 'add' event we can hook reliably here.
+cat > /etc/udev/rules.d/60-bos-readahead.rules <<EOF
 # Managed by bos-scripts-collection / configure-usb-boot-optimization.sh
-ACTION=="add", KERNEL=="$devbase", RUN+="/sbin/blockdev --setra $readahead $device"
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="$devbase", RUN+="/sbin/blockdev --setra $readahead $device"
 EOF
-    echo "Read-ahead set and persisted via udev."
-else
-    echo "WARNING: blockdev --setra failed on $device."
+
+# Apply now to every relevant block device, and persist dm/LV via a oneshot unit.
+for t in "${ra_targets[@]}"; do
+    if blockdev --setra "$readahead" "$t" >/dev/null 2>&1; then
+        echo "  read-ahead set on $t"
+    else
+        echo "  WARNING: blockdev --setra failed on $t"
+    fi
+done
+
+if [[ "${#ra_targets[@]}" -gt 1 ]]; then
+    # Persist dm/LV read-ahead across reboots via a tiny systemd oneshot.
+    cat > /etc/systemd/system/bos-readahead.service <<EOF
+# Managed by bos-scripts-collection / configure-usb-boot-optimization.sh
+[Unit]
+Description=Apply bos-scripts read-ahead to root block devices
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/blockdev --setra $readahead ${ra_targets[*]}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now bos-readahead.service >/dev/null 2>&1; then
+        echo "  bos-readahead.service enabled (persists read-ahead on dm/LV)."
+    else
+        echo "  WARNING: failed to enable bos-readahead.service."
+    fi
 fi
 
 # -------------------------------
@@ -322,11 +429,18 @@ echo "=== Verification ==="
 echo -n "Root mount options: "
 mount | awk '$3 == "/" {print $6; exit}'
 
-echo -n "Read-ahead ($device): "
-blockdev --getra "$device" 2>/dev/null || echo "n/a"
+echo "Read-ahead:"
+for t in "${ra_targets[@]}"; do
+    printf '  %-40s %s\n' "$t" "$(blockdev --getra "$t" 2>/dev/null || echo n/a)"
+done
 
-echo "Write cache:"
-hdparm -I "$device" 2>/dev/null | grep -i 'Write cache' || echo "  (hdparm not applicable to $device)"
+if [[ "$dev_is_ata" -eq 1 ]]; then
+    echo "Write cache ($device):"
+    hdparm -W "$device" 2>/dev/null | sed 's/^/  /' \
+        || echo "  (hdparm -W query failed)"
+else
+    echo "Write cache: (skipped -- $device is not an ATA device; transport=$dev_transport)"
+fi
 
 echo "zram devices:"
 zramctl 2>/dev/null || echo "  (zramctl unavailable)"
