@@ -103,7 +103,10 @@ USAGE
 done
 
 # start logging
-exec 1>> "$log" 2>&1
+# Tee all stdout/stderr to both the log file (appended) and the console
+# so output is visible during interactive runs and captured for managed
+# deployments / post-mortem review.
+exec > >(tee -a "$log") 2>&1
 
 echo ""
 echo "##############################################################"

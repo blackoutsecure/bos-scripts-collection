@@ -57,8 +57,11 @@ grubbackup="/etc/default/grub.backup.$(date +%Y%m%d-%H%M%S)"
 kernelparam="systemd.unified_cgroup_hierarchy=0"
 
 # start logging
+# Tee all stdout/stderr to both the log file (appended) and the console
+# so output is visible during interactive runs and captured for managed
+# deployments / post-mortem review.
 
-exec 1>> "$log" 2>&1
+exec > >(tee -a "$log") 2>&1
 
 # Begin Script Body
 
