@@ -200,21 +200,29 @@ if [[ "$mode" == "check" ]]; then
         report FAIL "nodesource sources list" "missing or wrong major in $listfile"
     fi
 
-    # Stale NodeSource lists for OTHER majors must not be present
+    # Stale NodeSource sources for OTHER majors must not be present.
+    # Scan every file under /etc/apt/sources.list.d (any name/extension)
+    # plus /etc/apt/sources.list, regardless of legacy vs deb822 syntax.
     shopt -s nullglob
     stale_found=""
-    for f in /etc/apt/sources.list.d/nodesource*.list; do
-        if grep -q '^deb .*deb\.nodesource\.com/node_' "$f" 2>/dev/null \
-           && ! grep -Fxq "$expected_repo_line" "$f"; then
-            stale_found="$f"
-            break
-        fi
+    scan_files=(/etc/apt/sources.list.d/*)
+    [[ -f /etc/apt/sources.list ]] && scan_files+=(/etc/apt/sources.list)
+    for f in "${scan_files[@]}"; do
+        [[ -f "$f" ]] || continue
+        # Each unique node_X.x reference in the file.
+        while IFS= read -r m; do
+            if [[ -n "$m" && "$m" != "$node_major" ]]; then
+                stale_found="$f (major $m)"
+                break 2
+            fi
+        done < <(grep -oE 'deb\.nodesource\.com/node_[0-9]+\.x' "$f" 2>/dev/null \
+                   | sed -E 's|.*node_([0-9]+)\.x|\1|' | sort -u)
     done
     shopt -u nullglob
     if [[ -z "$stale_found" ]]; then
-        report PASS "no stale nodesource lists" "ok"
+        report PASS "no stale nodesource sources" "ok"
     else
-        report FAIL "no stale nodesource lists" "found $stale_found"
+        report FAIL "no stale nodesource sources" "$stale_found"
     fi
 
     # APT pin for nodejs
@@ -313,30 +321,63 @@ echo "[3/4] Configuring NodeSource APT repository for Node.js $node_major..."
 arch="$(dpkg --print-architecture)"
 repo_line="deb [arch=${arch} signed-by=${keyring}] https://deb.nodesource.com/node_${node_major}.x nodistro main"
 
-# Remove any stale NodeSource list files for OTHER major versions so APT
-# does not silently prefer a higher line (e.g. an older 24.x list left
-# over from a previous install would outrank our pinned 22.x).
+# Remove any stale NodeSource sources for OTHER major versions.
+# We scan EVERY file under /etc/apt/sources.list.d (any name, any
+# extension -- legacy .list and deb822 .sources) for references to
+# deb.nodesource.com/node_X.x and delete the file if X != $node_major.
+# Files whose only NodeSource reference matches our desired major are
+# kept untouched. Anything we delete is backed up to /var/backups first.
+backupdir="/var/backups/install-nodejs-$(date +%Y%m%d-%H%M%S)"
 shopt -s nullglob
-for stale in /etc/apt/sources.list.d/nodesource*.list; do
-    if [[ "$stale" != "$listfile" ]] || ! grep -Fxq "$repo_line" "$stale" 2>/dev/null; then
-        if grep -q '^deb .*deb\.nodesource\.com/node_' "$stale" 2>/dev/null \
-           && ! grep -Fxq "$repo_line" "$stale"; then
-            echo "Removing stale NodeSource list: $stale"
-            rm -f "$stale"
+for f in /etc/apt/sources.list.d/*; do
+    [[ -f "$f" ]] || continue
+    # Pull every node_X.x reference in the file (URI or deb822 URIs:).
+    mapfile -t majors_in_file < <(
+        grep -oE 'deb\.nodesource\.com/node_[0-9]+\.x' "$f" 2>/dev/null \
+            | sed -E 's|.*node_([0-9]+)\.x|\1|' \
+            | sort -u
+    )
+    [[ "${#majors_in_file[@]}" -eq 0 ]] && continue
+    # File mentions nodesource. Keep it only if every reference is our major.
+    keep=1
+    for m in "${majors_in_file[@]}"; do
+        if [[ "$m" != "$node_major" ]]; then
+            keep=0
+            break
         fi
+    done
+    if [[ "$keep" -eq 0 ]]; then
+        mkdir -p "$backupdir"
+        cp -a "$f" "$backupdir/"
+        echo "Removing stale NodeSource source: $f (had majors: ${majors_in_file[*]}; backup in $backupdir)"
+        rm -f "$f"
     fi
 done
 shopt -u nullglob
 
+# Also check the master /etc/apt/sources.list -- comment out any
+# nodesource entries pointing at a different major. We don't delete
+# this file; we patch it in place with a backup.
+if [[ -f /etc/apt/sources.list ]] \
+   && grep -E '^[[:space:]]*deb[[:space:]].*deb\.nodesource\.com/node_[0-9]+\.x' /etc/apt/sources.list \
+        | grep -vq "node_${node_major}\.x"; then
+    mkdir -p "$backupdir"
+    cp -a /etc/apt/sources.list "$backupdir/"
+    sed -i -E "s|^[[:space:]]*deb[[:space:]].*deb\\.nodesource\\.com/node_([0-9]+)\\.x.*|# disabled by install-nodejs.sh (was major \\1): &|" \
+        /etc/apt/sources.list
+    echo "Disabled stale NodeSource entries in /etc/apt/sources.list (backup in $backupdir)."
+fi
+
 if ! grep -Fxq "$repo_line" "$listfile" 2>/dev/null; then
     echo "$repo_line" > "$listfile"
+    chmod 0644 "$listfile"
     echo "NodeSource APT repo written to $listfile."
 else
     echo "NodeSource APT repo already configured."
 fi
 
-# Pin nodejs to the requested major so APT can never pick a higher line,
-# even if another nodesource list is somehow re-introduced later.
+# Pin nodejs to the requested major as a defense in depth so any future
+# stray nodesource source can't silently upgrade past our line.
 cat > "$prefsfile" <<EOF
 # Managed by install-nodejs.sh -- pin nodejs to the ${node_major}.x line.
 Package: nodejs
@@ -350,12 +391,24 @@ if ! apt-get update; then
     exit 1
 fi
 
+# Pick the highest available nodejs version on the requested major line.
+# Going through `apt-cache madison` (instead of relying on apt's candidate
+# selection) sidesteps any pin-priority / installed-version edge cases on
+# hosts that previously had a higher major installed.
+target_version="$(apt-cache madison nodejs 2>/dev/null \
+    | awk -v m="$node_major" '{ver=$3; sub(/^[0-9]+:/,"",ver); if (ver ~ "^"m"\\.") {print ver; exit}}')"
+if [[ -z "$target_version" ]]; then
+    echo "ERROR: No nodejs ${node_major}.x candidate available from APT."
+    echo "       Inspect: apt-cache policy nodejs"
+    exit 1
+fi
+echo "Installing nodejs=${target_version}"
+
 # The NodeSource `nodejs` package bundles npm. Do NOT install the
 # Ubuntu `npm` package alongside it -- they conflict.
-# --allow-downgrades lets us move from a higher major (e.g. 24.x left
-# over from a previous install) down to the requested $node_major.
-if ! apt-get install -y --allow-downgrades nodejs; then
-    echo "ERROR: Failed to install nodejs from NodeSource."
+# --allow-downgrades is required when an older host had a higher major.
+if ! apt-get install -y --allow-downgrades "nodejs=${target_version}"; then
+    echo "ERROR: Failed to install nodejs=${target_version} from NodeSource."
     exit 1
 fi
 echo "Node.js package installed."
