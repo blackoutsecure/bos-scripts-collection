@@ -1,22 +1,22 @@
-# Application Management
+# macOS
 
-This folder groups macOS app lifecycle scripts by application.
+macOS administration scripts and supporting documentation.
 
 > Maintained by [Blackout Secure](https://blackoutsecure.app)
 
 ## Structure
 
-Each application has its own subfolder:
-
 ```
-macos/application-management/
-  <application-name>/
-    install-<application-name>.sh
-    README.md
+macos/
+  application-management/
+    <application-name>/
+      install-<application-name>.sh
+      README.md
 ```
 
-- Keep scripts and documentation directly in the app folder.
-- Use action-oriented names: `install-<app>.sh`, `uninstall-<app>.sh`.
+| Category | Folder |
+|---|---|
+| Application management | [`application-management/`](application-management/) |
 
 ## Deployment
 

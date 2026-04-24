@@ -1,34 +1,37 @@
-# macos-scripts-collection
+# bos-scripts-collection
 
-Reusable macOS administration scripts for enterprise deployment and manual execution.
+Reusable operating system administration scripts for enterprise deployment and manual execution.
 
 Maintained by [Blackout Secure](https://blackoutsecure.app)
 
 ## Repository Structure
 
+Scripts are organized by operating system at the top level, then by category, then by target (e.g. application name). For Linux, scripts are further grouped by distribution.
+
 ```
-application-management/
-  <application-name>/
-    install-<application-name>.sh
-    README.md
+<os>/
+  [<distribution>/]
+    <category>/
+      <target>/
+        <action>-<target>.sh
+        README.md
 ```
 
-Each application has its own folder under `application-management/`. Scripts and documentation live directly in that folder.
+Current top-level operating systems:
+
+| OS | Folder |
+|---|---|
+| macOS | [`macos/`](macos/) |
+| Linux | [`linux/`](linux/) |
 
 ## Usage Context
 
 Scripts are designed for:
 
-- MDM automated deployment (Intune / Company Portal, Jamf, Kandji, Mosyle, Workspace ONE)
+- MDM / endpoint management deployment (Intune / Company Portal, Jamf, Kandji, Mosyle, Workspace ONE for macOS; Intune, Ansible, and similar tooling for Linux)
 - Manual execution by administrators
 
-All scripts log activity and return predictable exit codes suitable for MDM monitoring.
-
-## Applications
-
-| Application | Folder |
-|---|---|
-| Sublime Text | [`application-management/sublime-text/`](application-management/sublime-text/) |
+All scripts log activity and return predictable exit codes suitable for automated monitoring.
 
 ## License
 
