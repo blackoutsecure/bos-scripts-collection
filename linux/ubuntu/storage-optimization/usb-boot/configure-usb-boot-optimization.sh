@@ -130,9 +130,10 @@ fi
 resolve_physical_disks() {
     local src="$1"
     [[ -z "$src" ]] && return 1
-    # lsblk -s gives the inverse tree (children -> parents). The TYPE=="disk"
-    # rows are the physical devices that back the given source.
-    lsblk -s -no NAME,TYPE "$src" 2>/dev/null \
+    # lsblk -s gives the inverse tree (children -> parents). -l forces list
+    # output so NAME doesn't contain tree-drawing glyphs (e.g. "└─sda").
+    # The TYPE=="disk" rows are the physical devices that back $src.
+    lsblk -s -l -no NAME,TYPE "$src" 2>/dev/null \
         | awk '$2 == "disk" {print "/dev/" $1}' \
         | sort -u
 }
