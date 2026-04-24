@@ -86,6 +86,7 @@ device=""
 noninteractive="${NONINTERACTIVE:-0}"
 mode="apply"          # apply | check
 tune_zram=1           # 0 = leave zram-tools defaults alone
+install_bfq=1         # 0 = never apt-install linux-modules-extra to get bfq
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --device)
@@ -111,17 +112,25 @@ while [[ $# -gt 0 ]]; do
             tune_zram=0
             shift
             ;;
+        --no-install-bfq)
+            install_bfq=0
+            shift
+            ;;
         -h|--help)
             cat <<USAGE
-Usage: $(basename "$0") [--device /dev/sdX] [--yes] [--check] [--no-zram-tune]
+Usage: $(basename "$0") [--device /dev/sdX] [--yes] [--check]
+                                  [--no-zram-tune] [--no-install-bfq]
 
-  --device PATH    Target whole-disk device (skips prompt)
-  --yes            Accept the auto-detected device without prompting
-                   (also enabled when NONINTERACTIVE=1 is exported)
-  --check          Read-only status check; do not modify anything.
-                   Exit code: 0 = all settings match, 2 = drift detected.
-  --no-zram-tune   Do NOT modify /etc/default/zramswap (leave the
-                   distro default of ~256 MB compressed swap).
+  --device PATH      Target whole-disk device (skips prompt)
+  --yes              Accept the auto-detected device without prompting
+                     (also enabled when NONINTERACTIVE=1 is exported)
+  --check            Read-only status check; do not modify anything.
+                     Exit code: 0 = all settings match, 2 = drift detected.
+  --no-zram-tune     Do NOT modify /etc/default/zramswap (leave the
+                     distro default of ~256 MB compressed swap).
+  --no-install-bfq   Do NOT apt-install linux-modules-extra to enable
+                     the 'bfq' I/O scheduler when missing on rotational
+                     disks. Falls back to mq-deadline silently.
 
 Exit codes:
   0  apply OK / already configured (apply mode), or all checks PASS (--check)
@@ -575,19 +584,51 @@ else
     iosched="none"
 fi
 
-# Verify the scheduler is actually available on the running kernel.
-sched_avail="$(cat "/sys/block/$devbase/queue/scheduler" 2>/dev/null || true)"
-if [[ -z "$sched_avail" ]]; then
+# Helper: re-read scheduler list.
+sched_avail() { cat "/sys/block/$devbase/queue/scheduler" 2>/dev/null || true; }
+
+avail="$(sched_avail)"
+if [[ -z "$avail" ]]; then
     echo "SKIP: /sys/block/$devbase/queue/scheduler not readable."
-elif ! grep -qw "$iosched" <<<"$sched_avail"; then
-    # Fall back to a scheduler the kernel actually offers.
-    if grep -qw "mq-deadline" <<<"$sched_avail"; then
-        echo "NOTE: '$iosched' not available; falling back to mq-deadline."
-        iosched="mq-deadline"
-    else
-        # Use the first listed scheduler (strip brackets from the active one).
-        iosched="$(echo "$sched_avail" | tr -d '[]' | awk '{print $1}')"
-        echo "NOTE: defaulting to first available scheduler '$iosched'."
+    iosched=""
+elif ! grep -qw "$iosched" <<<"$avail"; then
+    # Preferred scheduler not currently offered by the kernel.
+    if [[ "$iosched" == "bfq" ]]; then
+        # Try modprobe first -- bfq is a module, sometimes just not loaded.
+        if modprobe bfq >/dev/null 2>&1 && grep -qw bfq <<<"$(sched_avail)"; then
+            echo "loaded 'bfq' kernel module."
+            avail="$(sched_avail)"
+        elif [[ "$install_bfq" -eq 1 ]]; then
+            # bfq lives in linux-modules-extra-$(uname -r) on Ubuntu Server.
+            kpkg="linux-modules-extra-$(uname -r)"
+            if dpkg -s "$kpkg" >/dev/null 2>&1; then
+                echo "NOTE: '$kpkg' already installed but 'bfq' still unavailable."
+            else
+                echo "Installing '$kpkg' to enable the bfq I/O scheduler..."
+                export DEBIAN_FRONTEND=noninteractive
+                if apt-get update -y >/dev/null 2>&1 \
+                   && apt-get install -y "$kpkg" >/dev/null 2>&1; then
+                    echo "  installed $kpkg"
+                    modprobe bfq >/dev/null 2>&1 || true
+                    avail="$(sched_avail)"
+                else
+                    echo "  WARNING: failed to install $kpkg (continuing without bfq)."
+                fi
+            fi
+        else
+            echo "NOTE: bfq missing and --no-install-bfq specified; not installing."
+        fi
+    fi
+
+    # Re-check after modprobe / install attempt.
+    if ! grep -qw "$iosched" <<<"$avail"; then
+        if grep -qw "mq-deadline" <<<"$avail"; then
+            echo "NOTE: '$iosched' not available; falling back to mq-deadline."
+            iosched="mq-deadline"
+        else
+            iosched="$(echo "$avail" | tr -d '[]' | awk '{print $1}')"
+            echo "NOTE: defaulting to first available scheduler '$iosched'."
+        fi
     fi
 fi
 
