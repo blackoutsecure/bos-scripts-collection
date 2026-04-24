@@ -41,7 +41,7 @@
 #     stat -fc %T /sys/fs/cgroup/    # expect "tmpfs" (v1) instead of "cgroup2fs"
 #
 # Variables:
-#   scriptname  - Display name used in log messages
+#   appname  - Display name used in log messages
 #   log         - Full path of the log file written by this script
 #   grubfile    - Path to the GRUB defaults file to modify
 #   grubbackup  - Path of the timestamped backup of $grubfile
@@ -50,7 +50,7 @@
 
 # Define variables
 
-scriptname="Cgroups v1 Configuration"
+appname="Cgroups v1 Configuration"
 log="/var/log/configure-cgroups-v1.log"
 grubfile="/etc/default/grub"
 grubbackup="/etc/default/grub.backup.$(date +%Y%m%d-%H%M%S)"
@@ -85,7 +85,7 @@ exec > >(tee -a "$log") 2>&1
 
 echo ""
 echo "##############################################################"
-echo "# $(date) | Starting $scriptname"
+echo "# $(date) | Starting $appname"
 echo "##############################################################"
 
 # Require root (no interactive sudo prompts in managed deployment)
@@ -212,7 +212,7 @@ grep "^GRUB_CMDLINE_LINUX=" "$grubfile"
 
 echo ""
 echo "##############################################################"
-echo "# $(date) | $scriptname complete. Reboot required to apply."
+echo "# $(date) | $appname complete. Reboot required to apply."
 echo "##############################################################"
 
 exit 0

@@ -5,42 +5,22 @@
 # https://blackoutsecure.app
 #
 # Script:  install-sublime-text.sh
-# Purpose: Automatically downloads and installs the latest
-#          stable build of Sublime Text on macOS.
+# Purpose: Downloads and installs the latest stable build of
+#          Sublime Text on macOS into /Applications.
 #
-# The script queries the Sublime Text update API to obtain the
-# current stable build number, constructs the download URL,
-# downloads the .zip archive, extracts it, and copies the app
-# bundle to /Applications.
-#
-# Detection / Idempotency:
-#   If Sublime Text is already installed at $apppath and
-#   $forceInstall is "false", the script exits immediately
-#   with code 0 and logs "already installed". It is safe to
-#   run multiple times without side effects.
+# Idempotency:
+#   If $apppath exists and $forceInstall=false, exits 0 with
+#   "already installed". Safe to run multiple times.
 #
 # Deployment:
-#   MDM (Intune / Company Portal, Jamf, Kandji, Mosyle,
-#        Workspace ONE, or any MDM that runs shell scripts):
-#     Deploy as a managed shell script or custom app install.
-#     All activity is logged to $log for review.
-#     Monitor the exit code returned to your MDM console:
+#   MDM (Intune, Jamf, Kandji, Mosyle, Workspace ONE):
+#     Activity is streamed to both the console and $log.
+#     Exit codes:
 #       0 = success (installed or already present)
 #       1 = failure (review log for details)
 #
 #   Manual:
 #     sudo bash ./application-management/sublime-text/install-sublime-text.sh
-#
-# Variables:
-#   tempfile      - Temporary path where the .zip download is saved
-#   appname       - Display name used in log messages
-#   apppath       - Expected installation path; used to detect
-#                   whether Sublime Text is already installed
-#   log           - Full path of the log file written by this script
-#   mountpoint    - Temporary mount point reserved for .dmg handling
-#   unzipdir      - Temporary directory used to extract the .zip archive
-#   forceInstall  - Set to "true" to reinstall even if Sublime Text
-#                   is already present (useful for forced upgrades)
 # =============================================================
 
 # Define variables
@@ -49,31 +29,30 @@ tempfile="/tmp/sublime.zip"
 appname="Sublime Text"
 apppath="/Applications/Sublime Text.app"
 log="/var/log/installsublime.log"
-mountpoint="/tmp/sublime_mount"
 unzipdir="/tmp/sublime_extract"
 forceInstall="false"
+versionapi="https://www.sublimetext.com/updates/4/stable_update_check"
 
-# start logging
+# start logging (console + file)
 
-exec 1>> "$log" 2>&1
+exec > >(tee -a "$log") 2>&1
 
 # Begin Script Body
 
 echo ""
 echo "##############################################################"
 echo "# $(date) | Starting install of $appname"
-echo "############################################################"
+echo "##############################################################"
 echo ""
 
-# Check if app already exists
 if [ "$forceInstall" = "false" ] && [ -d "$apppath" ]; then
    echo "$(date) | $appname is already installed"
    exit 0
 fi
 
-# Get the latest version from Sublime Text API
 echo "$(date) | Fetching latest version"
-version=$(curl -s https://www.sublimetext.com/updates/4/stable_update_check | grep -o '"latest_version": [0-9]*' | grep -o '[0-9]*')
+version=$(curl --proto '=https' --tlsv1.2 -fsSL "$versionapi" \
+   | grep -o '"latest_version": [0-9]*' | grep -o '[0-9]*')
 
 if [ -z "$version" ]; then
    echo "$(date) | Failed to fetch latest version"
@@ -84,73 +63,29 @@ echo "$(date) | Latest version: $version"
 weburl="https://download.sublimetext.com/sublime_text_build_${version}_mac.zip"
 echo "$(date) | Download URL: $weburl"
 
-# Let's download the files we need and attempt to install...
-
 echo "$(date) | Downloading $appname"
-curl -L -f -o "$tempfile" "$weburl"
-
-if [ "$?" != "0" ]; then
-  # Something went wrong here, either the download failed or the mount/extract failed
-  # Intune will pick up the exit status and the IT Pro can use that to determine what went wrong.
-  # Intune can also return the log file if requested by the admin
+if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$tempfile" "$weburl"; then
    echo "$(date) | Failed to download $appname"
    exit 1
 fi
 
-if [[ "$weburl" == *.dmg ]]; then
-   echo "$(date) | Mounting $appname disk image"
-   mkdir -p "$mountpoint"
-   hdiutil attach "$tempfile" -mountpoint "$mountpoint" -nobrowse
-
-   if [ "$?" = "0" ]; then
-      echo "$(date) | Copying $appname to Applications"
-      cp -r "$mountpoint/Sublime Text.app" "$apppath"
-
-      if [ "$?" = "0" ]; then
-         echo "$(date) | $appname Installed"
-         echo "$(date) | Unmounting disk image"
-         hdiutil detach "$mountpoint"
-         echo "$(date) | Cleaning Up"
-         rm -rf "$tempfile"
-         rm -rf "$mountpoint"
-         exit 0
-      else
-         echo "$(date) | Failed to copy $appname to Applications"
-         hdiutil detach "$mountpoint"
-         rm -rf "$tempfile"
-         rm -rf "$mountpoint"
-         exit 1
-      fi
-   else
-      echo "$(date) | Failed to mount $appname"
-      exit 1
-   fi
-else
-   echo "$(date) | Extracting $appname archive"
-   rm -rf "$unzipdir"
-   mkdir -p "$unzipdir"
-   unzip -q "$tempfile" -d "$unzipdir"
-
-   if [ "$?" = "0" ] && [ -d "$unzipdir/Sublime Text.app" ]; then
-      echo "$(date) | Copying $appname to Applications"
-      cp -r "$unzipdir/Sublime Text.app" "$apppath"
-
-      if [ "$?" = "0" ]; then
-         echo "$(date) | $appname Installed"
-         echo "$(date) | Cleaning Up"
-         rm -rf "$tempfile"
-         rm -rf "$unzipdir"
-         exit 0
-      else
-         echo "$(date) | Failed to copy $appname to Applications"
-         rm -rf "$tempfile"
-         rm -rf "$unzipdir"
-         exit 1
-      fi
-   else
-      echo "$(date) | Failed to extract $appname"
-      rm -rf "$tempfile"
-      rm -rf "$unzipdir"
-      exit 1
-   fi
+echo "$(date) | Extracting $appname archive"
+rm -rf "$unzipdir"
+mkdir -p "$unzipdir"
+if ! unzip -q "$tempfile" -d "$unzipdir" || [ ! -d "$unzipdir/Sublime Text.app" ]; then
+   echo "$(date) | Failed to extract $appname"
+   rm -rf "$tempfile" "$unzipdir"
+   exit 1
 fi
+
+echo "$(date) | Copying $appname to Applications"
+if ! cp -r "$unzipdir/Sublime Text.app" "$apppath"; then
+   echo "$(date) | Failed to copy $appname to Applications"
+   rm -rf "$tempfile" "$unzipdir"
+   exit 1
+fi
+
+echo "$(date) | $appname installed"
+echo "$(date) | Cleaning up"
+rm -rf "$tempfile" "$unzipdir"
+exit 0

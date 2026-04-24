@@ -16,11 +16,13 @@ linux/ubuntu/
 
 | Category | Folder |
 |---|---|
+| Application management | [`application-management/`](application-management/) |
+| Container runtime | [`container-runtime/`](container-runtime/) |
 | Power management | [`power-management/`](power-management/) |
 | Storage optimization | [`storage-optimization/`](storage-optimization/) |
 | System configuration | [`system-configuration/`](system-configuration/) |
 
-Additional categories (for example `application-management/`, `security/`) will be added as scripts are contributed.
+Additional categories (for example `security/`) will be added as scripts are contributed.
 
 ## Conventions
 

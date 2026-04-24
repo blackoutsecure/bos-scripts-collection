@@ -59,7 +59,7 @@
 #   --check         - read-only audit. Exit 0 = all PASS, 2 = drift
 #
 # Variables:
-#   scriptname    - Display name used in log messages
+#   appname    - Display name used in log messages
 #   log           - Full path of the log file written by this script
 #   logindfile    - Path to the systemd logind configuration file
 #   logindbackup  - Timestamped backup of $logindfile
@@ -69,7 +69,7 @@
 
 # Define variables
 
-scriptname="No-Suspend Configuration"
+appname="No-Suspend Configuration"
 log="/var/log/configure-no-suspend.log"
 logindfile="/etc/systemd/logind.conf"
 logindbackup="/etc/systemd/logind.conf.backup.$(date +%Y%m%d-%H%M%S)"
@@ -119,7 +119,7 @@ exec > >(tee -a "$log") 2>&1
 
 echo ""
 echo "##############################################################"
-echo "# $(date) | Starting $scriptname"
+echo "# $(date) | Starting $appname"
 echo "##############################################################"
 
 # Require root for the system-wide changes
@@ -356,7 +356,7 @@ fi
 
 echo ""
 echo "##############################################################"
-echo "# $(date) | $scriptname complete. Reboot recommended."
+echo "# $(date) | $appname complete. Reboot recommended."
 echo "##############################################################"
 
 exit 0

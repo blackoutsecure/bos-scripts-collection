@@ -65,7 +65,7 @@
 #     sudo bash ./linux/ubuntu/storage-optimization/usb-boot/configure-usb-boot-optimization.sh
 #
 # Variables:
-#   scriptname - Display name used in log messages
+#   appname - Display name used in log messages
 #   log        - Full path of the log file written by this script
 #   readahead  - Read-ahead size in 512-byte sectors
 #   sysctlfile - Sysctl drop-in file for VM writeback tuning
@@ -73,7 +73,7 @@
 
 # Define variables
 
-scriptname="USB Boot Optimization"
+appname="USB Boot Optimization"
 log="/var/log/configure-usb-boot-optimization.log"
 readahead=4096
 sysctlfile="/etc/sysctl.d/60-bos-usb-boot.conf"
@@ -154,7 +154,7 @@ exec > >(tee -a "$log") 2>&1
 
 echo ""
 echo "##############################################################"
-echo "# $(date) | Starting $scriptname"
+echo "# $(date) | Starting $appname"
 echo "##############################################################"
 
 # Require root
@@ -911,7 +911,7 @@ grep -E '^[[:space:]]*(PERCENT|ALLOCATION)=' "$zramswapfile" 2>/dev/null \
 
 echo ""
 echo "##############################################################"
-echo "# $(date) | $scriptname complete. Reboot recommended."
+echo "# $(date) | $appname complete. Reboot recommended."
 echo "##############################################################"
 
 exit 0

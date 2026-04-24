@@ -42,13 +42,13 @@
 #         # * dash/sh: false   => /bin/sh is bash (correct)
 #
 # Variables:
-#   scriptname - Display name used in log messages
+#   appname - Display name used in log messages
 #   log        - Full path of the log file written by this script
 # =============================================================
 
 # Define variables
 
-scriptname="Configure /bin/sh -> bash"
+appname="Configure /bin/sh -> bash"
 log="/var/log/configure-sh-to-bash.log"
 
 # Argument parsing
@@ -80,7 +80,7 @@ exec > >(tee -a "$log") 2>&1
 
 echo ""
 echo "##############################################################"
-echo "# $(date) | Starting $scriptname"
+echo "# $(date) | Starting $appname"
 echo "##############################################################"
 
 # Require root (no interactive sudo prompts in managed deployment)
@@ -238,7 +238,7 @@ fi
 
 echo ""
 echo "##############################################################"
-echo "# $(date) | $scriptname complete. /bin/sh now points to bash."
+echo "# $(date) | $appname complete. /bin/sh now points to bash."
 echo "##############################################################"
 
 exit 0
