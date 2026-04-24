@@ -466,14 +466,28 @@ if [[ "$mode" == "check" ]]; then
     fi
 
     # Disabled noisy services
+    # `systemctl is-enabled` returns 0 for several states. Treat anything
+    # that means "won't auto-start" as PASS: disabled, masked, static (units
+    # with no [Install] section -- they only run if pulled in or activated;
+    # we mask them in the apply step so this becomes definitive), indirect,
+    # linked. Only enabled / alias / enabled-runtime are FAIL.
     for svc in apport.service whoopsie.service motd-news.service motd-news.timer; do
         if ! systemctl list-unit-files 2>/dev/null | grep -q "^${svc}"; then
             report SKIP "service $svc" "not installed"
-        elif systemctl is-enabled "$svc" >/dev/null 2>&1; then
-            report FAIL "service $svc" "still enabled"
-        else
-            report PASS "service $svc" "disabled/masked"
+            continue
         fi
+        state="$(systemctl is-enabled "$svc" 2>/dev/null || echo unknown)"
+        case "$state" in
+            masked|disabled|static|indirect|linked)
+                report PASS "service $svc" "$state"
+                ;;
+            enabled|alias|enabled-runtime)
+                report FAIL "service $svc" "$state"
+                ;;
+            *)
+                report FAIL "service $svc" "unexpected state '$state'"
+                ;;
+        esac
     done
 
     # sysctl drop-in
@@ -821,10 +835,18 @@ fi
 # -------------------------------
 echo "[8/9] Disabling noisy background services..."
 for svc in apport.service whoopsie.service motd-news.service motd-news.timer; do
-    if systemctl list-unit-files | grep -q "^${svc}"; then
-        systemctl disable --now "$svc" >/dev/null 2>&1 \
-            && echo "  disabled $svc" \
-            || echo "  WARNING: could not disable $svc"
+    if ! systemctl list-unit-files 2>/dev/null | grep -q "^${svc}"; then
+        continue
+    fi
+    # Stop first (best effort), then mask. We mask rather than just disable
+    # because units like whoopsie.service and motd-news.service are 'static'
+    # (no [Install] section) -- 'disable' is a no-op on them. Mask reliably
+    # prevents start via every path (manual, D-Bus activation, dependency).
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+    if systemctl mask "$svc" >/dev/null 2>&1; then
+        echo "  masked $svc"
+    else
+        echo "  WARNING: could not mask $svc"
     fi
 done
 

@@ -51,6 +51,24 @@
 scriptname="Configure /bin/sh -> bash"
 log="/var/log/configure-sh-to-bash.log"
 
+# Argument parsing
+mode="apply"
+for arg in "$@"; do
+    case "$arg" in
+        --check|--status) mode="check" ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--check]
+  (no args)   Apply: reconfigure dash so /bin/sh -> bash
+  --check     Read-only audit: report whether /bin/sh is bash and the
+              debconf selection matches. Exit 0 if compliant, 2 on drift.
+EOF
+            exit 0
+            ;;
+        *) echo "ERROR: unknown argument '$arg' (try --help)"; exit 1 ;;
+    esac
+done
+
 # start logging
 # Tee all stdout/stderr to both the log file (appended) and the console
 # so output is visible during interactive runs and captured for managed
@@ -69,6 +87,56 @@ echo "##############################################################"
 if [[ "$EUID" -ne 0 ]]; then
     echo "ERROR: This script must be run as root (EUID 0)."
     exit 1
+fi
+
+# -------------------------------
+# --check (read-only audit)
+# -------------------------------
+if [[ "$mode" == "check" ]]; then
+    echo ""
+    echo "=== --check (read-only) ==="
+    pass=0; fail=0
+    report() {
+        local verdict="$1" name="$2" detail="$3"
+        printf "  [%s] %-32s %s\n" "$verdict" "$name" "$detail"
+        case "$verdict" in PASS) ((pass++));; FAIL) ((fail++));; esac
+    }
+
+    target="$(readlink -f /bin/sh 2>/dev/null || true)"
+    if [[ "$(basename "${target:-}")" == "bash" ]]; then
+        report PASS "/bin/sh symlink target" "$target"
+    else
+        report FAIL "/bin/sh symlink target" "${target:-missing}"
+    fi
+
+    bv="$(sh -c 'echo $BASH_VERSION' 2>/dev/null || true)"
+    if [[ -n "$bv" ]]; then
+        report PASS "sh -c \$BASH_VERSION"   "$bv"
+    else
+        report FAIL "sh -c \$BASH_VERSION"   "empty (sh is not bash)"
+    fi
+
+    if command -v debconf-show >/dev/null 2>&1; then
+        dline="$(debconf-show dash 2>/dev/null | grep 'dash/sh' || true)"
+        if [[ "$dline" == *"false"* ]]; then
+            report PASS "debconf dash/sh"        "false (bash)"
+        elif [[ -z "$dline" ]]; then
+            report FAIL "debconf dash/sh"        "not set"
+        else
+            report FAIL "debconf dash/sh"        "$dline"
+        fi
+    else
+        report FAIL "debconf-show available"     "missing"
+    fi
+
+    echo ""
+    echo "Summary: $pass PASS / $fail FAIL"
+    if [[ "$fail" -gt 0 ]]; then
+        echo "DRIFT DETECTED. Re-run without --check to reconcile."
+        exit 2
+    fi
+    echo "/bin/sh already points to bash."
+    exit 0
 fi
 
 # Verify required tooling is present

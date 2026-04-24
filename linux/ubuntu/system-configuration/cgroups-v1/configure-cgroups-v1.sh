@@ -56,6 +56,24 @@ grubfile="/etc/default/grub"
 grubbackup="/etc/default/grub.backup.$(date +%Y%m%d-%H%M%S)"
 kernelparam="systemd.unified_cgroup_hierarchy=0"
 
+# Argument parsing
+mode="apply"
+for arg in "$@"; do
+    case "$arg" in
+        --check|--status) mode="check" ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--check]
+  (no args)   Apply: backup grub, add ${kernelparam}, update-grub
+  --check     Read-only audit: report whether GRUB and the running kernel
+              are configured for cgroups v1. Exit 0 if compliant, 2 on drift.
+EOF
+            exit 0
+            ;;
+        *) echo "ERROR: unknown argument '$arg' (try --help)"; exit 1 ;;
+    esac
+done
+
 # start logging
 # Tee all stdout/stderr to both the log file (appended) and the console
 # so output is visible during interactive runs and captured for managed
@@ -80,6 +98,66 @@ fi
 if [[ ! -f "$grubfile" ]]; then
     echo "ERROR: $grubfile not found. This script targets Ubuntu/Debian-style GRUB systems."
     exit 1
+fi
+
+# -------------------------------
+# --check (read-only audit)
+# -------------------------------
+if [[ "$mode" == "check" ]]; then
+    echo ""
+    echo "=== --check (read-only) ==="
+    pass=0; fail=0
+    report() {
+        local verdict="$1" name="$2" detail="$3"
+        printf "  [%s] %-40s %s\n" "$verdict" "$name" "$detail"
+        case "$verdict" in PASS) ((pass++));; FAIL) ((fail++));; esac
+    }
+
+    # 1. GRUB defaults file contains the parameter
+    if grep -Eq "^GRUB_CMDLINE_LINUX=\"[^\"]*${kernelparam}" "$grubfile"; then
+        report PASS "grub cmdline param" "${kernelparam} present in $grubfile"
+    else
+        report FAIL "grub cmdline param" "${kernelparam} NOT in $grubfile"
+    fi
+
+    # 2. Generated grub.cfg references it (i.e. update-grub has been run since edit)
+    grubcfg=""
+    for f in /boot/grub/grub.cfg /boot/efi/EFI/ubuntu/grub.cfg /boot/efi/EFI/debian/grub.cfg; do
+        [[ -f "$f" ]] && { grubcfg="$f"; break; }
+    done
+    if [[ -z "$grubcfg" ]]; then
+        report FAIL "generated grub.cfg" "could not locate grub.cfg under /boot"
+    elif grep -q "$kernelparam" "$grubcfg"; then
+        report PASS "generated grub.cfg" "${kernelparam} baked into $grubcfg"
+    else
+        report FAIL "generated grub.cfg" "${kernelparam} missing from $grubcfg (run update-grub)"
+    fi
+
+    # 3. Running kernel cmdline (only true after a reboot)
+    if grep -q "$kernelparam" /proc/cmdline; then
+        report PASS "running kernel cmdline" "${kernelparam} active"
+    else
+        report FAIL "running kernel cmdline" "not active (reboot required)"
+    fi
+
+    # 4. Live cgroup hierarchy
+    fstype="$(stat -fc %T /sys/fs/cgroup/ 2>/dev/null || echo unknown)"
+    if [[ "$fstype" == "tmpfs" ]]; then
+        report PASS "live cgroup hierarchy" "tmpfs (cgroups v1)"
+    elif [[ "$fstype" == "cgroup2fs" ]]; then
+        report FAIL "live cgroup hierarchy" "cgroup2fs (still v2 — reboot required)"
+    else
+        report FAIL "live cgroup hierarchy" "unexpected fstype '$fstype'"
+    fi
+
+    echo ""
+    echo "Summary: $pass PASS / $fail FAIL"
+    if [[ "$fail" -gt 0 ]]; then
+        echo "DRIFT DETECTED. Re-run without --check to reconcile (and reboot if not yet applied)."
+        exit 2
+    fi
+    echo "All cgroups v1 settings active."
+    exit 0
 fi
 
 # -------------------------------

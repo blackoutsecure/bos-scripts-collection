@@ -183,12 +183,25 @@ if [[ "$mode" == "check" ]]; then
                     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${user_uid}/bus" \
                     "$@" 2>/dev/null
             }
-            ac="$(run_as_user_check gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type | tr -d \"'\")"
-            bat="$(run_as_user_check gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type | tr -d \"'\")"
-            idle="$(run_as_user_check gsettings get org.gnome.desktop.session idle-delay | awk '{print $NF}')"
-            [[ "$ac"  == "nothing" ]] && report PASS "GNOME ac suspend"      "nothing"  || report FAIL "GNOME ac suspend"      "got '${ac:-?}'"
-            [[ "$bat" == "nothing" ]] && report PASS "GNOME battery suspend" "nothing"  || report FAIL "GNOME battery suspend" "got '${bat:-?}'"
-            [[ "$idle" == "$idledelay" ]] && report PASS "GNOME idle-delay" "$idle" || report FAIL "GNOME idle-delay" "got '${idle:-?}', want $idledelay"
+            # If gsettings or the GNOME power schema isn't present (server / non-GNOME desktop / no DBus session),
+            # there is nothing to check — skip rather than report a false drift.
+            if ! run_as_user_check command -v gsettings >/dev/null 2>&1; then
+                report SKIP "GNOME power settings" "gsettings not available for $targetuser"
+                report SKIP "GNOME idle-delay"     "gsettings not available"
+            elif ! run_as_user_check gsettings list-schemas 2>/dev/null | grep -q '^org\.gnome\.settings-daemon\.plugins\.power$'; then
+                report SKIP "GNOME power settings" "GNOME power schema not installed"
+                report SKIP "GNOME idle-delay"     "GNOME desktop schema not installed"
+            else
+                ac="$(run_as_user_check gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type)"
+                bat="$(run_as_user_check gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type)"
+                idle="$(run_as_user_check gsettings get org.gnome.desktop.session idle-delay | awk '{print $NF}')"
+                # Strip surrounding single quotes that gsettings prints around string values.
+                ac="${ac//\'/}"
+                bat="${bat//\'/}"
+                [[ "$ac"  == "nothing" ]] && report PASS "GNOME ac suspend"      "nothing"  || report FAIL "GNOME ac suspend"      "got '${ac:-?}'"
+                [[ "$bat" == "nothing" ]] && report PASS "GNOME battery suspend" "nothing"  || report FAIL "GNOME battery suspend" "got '${bat:-?}'"
+                [[ "$idle" == "$idledelay" ]] && report PASS "GNOME idle-delay" "$idle" || report FAIL "GNOME idle-delay" "got '${idle:-?}', want $idledelay"
+            fi
         fi
         if [[ -n "$user_home" && -f "$user_home/.profile" ]] && grep -q "xset -dpms" "$user_home/.profile"; then
             report PASS "xset -dpms in ~/.profile" "present"
