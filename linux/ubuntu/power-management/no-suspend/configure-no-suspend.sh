@@ -47,11 +47,16 @@
 #     system-wide. All activity is logged to $log. Exit codes:
 #       0 = success (configured or already configured)
 #       1 = failure (review log for details)
+#       2 = drift detected (only emitted by --check)
 #     A reboot is recommended to ensure all consumers pick up
 #     the new logind configuration.
 #
 #   Manual:
 #     sudo bash ./linux/ubuntu/power-management/no-suspend/configure-no-suspend.sh
+#
+# Modes:
+#   apply (default) - reconcile the system to the desired state
+#   --check         - read-only audit. Exit 0 = all PASS, 2 = drift
 #
 # Variables:
 #   scriptname    - Display name used in log messages
@@ -74,6 +79,35 @@ idledelay=600
 # desktop-session steps will be skipped.
 targetuser="${SUDO_USER:-}"
 
+# Argument parsing
+mode="apply"   # apply | check
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check|--status)
+            mode="check"
+            shift
+            ;;
+        -h|--help)
+            cat <<USAGE
+Usage: $(basename "$0") [--check]
+
+  --check   Read-only status check; do not modify anything.
+            Exit code: 0 = all settings match, 2 = drift detected.
+
+Exit codes:
+  0  apply OK / already configured (apply mode), or all checks PASS (--check)
+  1  failure (review log for details)
+  2  drift detected (--check only)
+USAGE
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
 # start logging
 # Tee all stdout/stderr to both the log file (appended) and the console
 # so output is visible during interactive runs and captured for managed
@@ -92,6 +126,85 @@ echo "##############################################################"
 if [[ "$EUID" -ne 0 ]]; then
     echo "ERROR: This script must be run as root (EUID 0)."
     exit 1
+fi
+
+# =============================================================
+# --check (read-only status) mode
+# Exit 0 = all PASS, 2 = drift detected.
+# =============================================================
+if [[ "$mode" == "check" ]]; then
+    echo ""
+    echo "=== --check (read-only) ==="
+    fail=0
+    pass=0
+    skip=0
+    report() {
+        local status="$1" name="$2" detail="$3"
+        case "$status" in
+            PASS) pass=$((pass+1)) ;;
+            FAIL) fail=$((fail+1)) ;;
+            SKIP) skip=$((skip+1)) ;;
+        esac
+        printf '  [%-4s] %-32s %s\n' "$status" "$name" "$detail"
+    }
+
+    # systemd sleep targets must be masked
+    for unit in sleep.target suspend.target hibernate.target hybrid-sleep.target; do
+        state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+        if [[ "$state" == "masked" ]]; then
+            report PASS "unit $unit" "masked"
+        else
+            report FAIL "unit $unit" "state=${state:-unknown}"
+        fi
+    done
+
+    # logind keys
+    for kv in "HandleSuspendKey=ignore" "HandleLidSwitch=ignore" "HandleLidSwitchDocked=ignore"; do
+        if grep -Eq "^${kv%%=*}=${kv##*=}$" "$logindfile" 2>/dev/null; then
+            report PASS "logind $kv" "set"
+        else
+            report FAIL "logind $kv" "missing or wrong value in $logindfile"
+        fi
+    done
+
+    # GNOME / X11 desktop checks (only if a desktop user is in scope)
+    if [[ -z "$targetuser" || "$targetuser" == "root" ]]; then
+        report SKIP "GNOME power settings" "no desktop user (SUDO_USER empty/root)"
+        report SKIP "GNOME idle-delay" "no desktop user"
+        report SKIP "xset -dpms in ~/.profile" "no desktop user"
+    else
+        user_uid="$(id -u "$targetuser" 2>/dev/null || echo "")"
+        user_home="$(getent passwd "$targetuser" | cut -d: -f6)"
+        if [[ -z "$user_uid" ]]; then
+            report SKIP "GNOME power settings" "could not resolve uid for $targetuser"
+        else
+            run_as_user_check() {
+                sudo -u "$targetuser" \
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${user_uid}/bus" \
+                    "$@" 2>/dev/null
+            }
+            ac="$(run_as_user_check gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type | tr -d \"'\")"
+            bat="$(run_as_user_check gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type | tr -d \"'\")"
+            idle="$(run_as_user_check gsettings get org.gnome.desktop.session idle-delay | awk '{print $NF}')"
+            [[ "$ac"  == "nothing" ]] && report PASS "GNOME ac suspend"      "nothing"  || report FAIL "GNOME ac suspend"      "got '${ac:-?}'"
+            [[ "$bat" == "nothing" ]] && report PASS "GNOME battery suspend" "nothing"  || report FAIL "GNOME battery suspend" "got '${bat:-?}'"
+            [[ "$idle" == "$idledelay" ]] && report PASS "GNOME idle-delay" "$idle" || report FAIL "GNOME idle-delay" "got '${idle:-?}', want $idledelay"
+        fi
+        if [[ -n "$user_home" && -f "$user_home/.profile" ]] && grep -q "xset -dpms" "$user_home/.profile"; then
+            report PASS "xset -dpms in ~/.profile" "present"
+        else
+            report FAIL "xset -dpms in ~/.profile" "missing"
+        fi
+    fi
+
+    echo ""
+    echo "Summary: $pass PASS / $fail FAIL / $skip SKIP"
+    if [[ "$fail" -gt 0 ]]; then
+        echo "DRIFT DETECTED. Re-run without --check to reconcile."
+        exit 2
+    fi
+    echo "All applicable settings already configured."
+    exit 0
 fi
 
 # -------------------------------

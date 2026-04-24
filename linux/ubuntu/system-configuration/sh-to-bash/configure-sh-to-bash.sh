@@ -111,7 +111,10 @@ if [[ "$(basename "$current_target")" == "bash" ]]; then
 else
     # Pre-seed debconf so dpkg-reconfigure runs unattended.
     # dash/sh = false  => "No, do not install dash as /bin/sh"
-    if ! echo "dash dash/sh boolean false" | debconf-set-selections; then
+    # Mark the question as 'seen' so the noninteractive frontend will
+    # actually act on the seeded answer instead of skipping it.
+    if ! printf 'dash dash/sh boolean false\ndash dash/sh seen true\n' \
+            | debconf-set-selections; then
         echo "ERROR: debconf-set-selections failed."
         exit 1
     fi
@@ -122,6 +125,21 @@ else
         exit 1
     fi
     echo "dpkg-reconfigure dash completed."
+
+    # Some Ubuntu releases honor the debconf answer but still leave the
+    # /bin/sh symlink pointing at dash when reconfigured noninteractively.
+    # If that happened, repoint the symlink directly so the system state
+    # matches the debconf selection.
+    post_target="$(readlink -f /bin/sh 2>/dev/null || true)"
+    if [[ "$(basename "${post_target:-}")" != "bash" ]]; then
+        echo "WARNING: /bin/sh still points to '$post_target' after reconfigure."
+        echo "         Repointing /bin/sh -> bash directly."
+        if ! ln -sf bash /bin/sh; then
+            echo "ERROR: Failed to relink /bin/sh -> bash."
+            exit 1
+        fi
+        echo "/bin/sh symlink updated."
+    fi
 fi
 
 # -------------------------------
