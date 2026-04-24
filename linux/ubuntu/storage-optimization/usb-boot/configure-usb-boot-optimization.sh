@@ -476,7 +476,11 @@ if [[ "$mode" == "check" ]]; then
             report SKIP "service $svc" "not installed"
             continue
         fi
-        state="$(systemctl is-enabled "$svc" 2>/dev/null || echo unknown)"
+        # systemctl is-enabled can emit multiple lines (e.g. "disabled\nunknown"
+        # when an alias has no install info). We only care about the primary
+        # state on the first line.
+        state="$(systemctl is-enabled "$svc" 2>/dev/null | head -n1)"
+        [[ -z "$state" ]] && state="unknown"
         case "$state" in
             masked|disabled|static|indirect|linked)
                 report PASS "service $svc" "$state"

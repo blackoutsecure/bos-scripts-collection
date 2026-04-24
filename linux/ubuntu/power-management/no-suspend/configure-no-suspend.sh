@@ -150,7 +150,7 @@ if [[ "$mode" == "check" ]]; then
 
     # systemd sleep targets must be masked
     for unit in sleep.target suspend.target hibernate.target hybrid-sleep.target; do
-        state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+        state="$(systemctl is-enabled "$unit" 2>/dev/null | head -n1)"
         if [[ "$state" == "masked" ]]; then
             report PASS "unit $unit" "masked"
         else
