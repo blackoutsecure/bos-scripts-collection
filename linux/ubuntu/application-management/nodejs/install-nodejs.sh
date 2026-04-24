@@ -58,9 +58,14 @@
 #     All activity is logged to $log. Exit codes:
 #       0 = success (installed or already installed)
 #       1 = failure (review log for details)
+#       2 = drift detected (only emitted by --check)
 #
 #   Manual:
 #     sudo bash ./linux/ubuntu/application-management/nodejs/install-nodejs.sh
+#
+# Modes:
+#   apply (default) - reconcile the system to the desired state
+#   --check         - read-only audit. Exit 0 = all PASS, 2 = drift
 #
 # Variables:
 #   appname    - Display name used in log messages
@@ -78,10 +83,34 @@ log="/var/log/install-nodejs.log"
 
 # Current Node.js LTS major line. Override with NODE_MAJOR or arg 1.
 default_node_major="22"
-node_major="${1:-${NODE_MAJOR:-$default_node_major}}"
+
+# Argument parsing -- accept --check (and --help) without consuming the
+# positional NODE_MAJOR argument.
+mode="apply"
+positional=()
+for arg in "$@"; do
+    case "$arg" in
+        --check|--status) mode="check" ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--check] [NODE_MAJOR]
+  NODE_MAJOR  Optional Node.js major version line to install (default: ${default_node_major}).
+              May also be set via the NODE_MAJOR environment variable.
+  --check     Read-only audit: report whether NodeSource repo, signing
+              key, pin, and node/npm of the requested major are present.
+              Exit 0 if compliant, 2 on drift.
+EOF
+            exit 0
+            ;;
+        --*) echo "ERROR: unknown argument '$arg' (try --help)"; exit 1 ;;
+        *)   positional+=("$arg") ;;
+    esac
+done
+node_major="${positional[0]:-${NODE_MAJOR:-$default_node_major}}"
 
 keyring="/etc/apt/keyrings/nodesource.gpg"
 listfile="/etc/apt/sources.list.d/nodesource.list"
+prefsfile="/etc/apt/preferences.d/nodesource"
 
 # start logging
 exec > >(tee -a "$log") 2>&1
@@ -108,6 +137,139 @@ fi
 echo "Target Node.js major : $node_major"
 echo "Keyring              : $keyring"
 echo "Sources list         : $listfile"
+
+# =============================================================
+# --check (read-only status) mode
+# Exit 0 = all PASS, 2 = drift detected.
+# =============================================================
+if [[ "$mode" == "check" ]]; then
+    echo ""
+    echo "=== --check (read-only) ==="
+    pass=0; fail=0
+    report() {
+        local verdict="$1" name="$2" detail="$3"
+        printf "  [%-4s] %-40s %s\n" "$verdict" "$name" "$detail"
+        case "$verdict" in PASS) ((pass++));; FAIL) ((fail++));; esac
+    }
+
+    # Distro must be Debian/Ubuntu (apt-based)
+    if [[ -r /etc/os-release ]] && grep -Eq '^ID(_LIKE)?=.*(debian|ubuntu)' /etc/os-release; then
+        report PASS "operating system" "Debian/Ubuntu family"
+    else
+        report FAIL "operating system" "not Debian/Ubuntu (apt required)"
+    fi
+
+    # Required prerequisite tools
+    for cmd in apt-get dpkg curl gpg dpkg-query; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            report PASS "tool $cmd" "$(command -v "$cmd")"
+        else
+            report FAIL "tool $cmd" "missing"
+        fi
+    done
+
+    # Prerequisite packages installed by step [1/4]
+    for pkg in ca-certificates curl gnupg apt-transport-https; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+            report PASS "package $pkg" "installed"
+        else
+            report FAIL "package $pkg" "missing"
+        fi
+    done
+
+    # Keyrings directory
+    if [[ -d /etc/apt/keyrings ]]; then
+        report PASS "/etc/apt/keyrings dir" "present"
+    else
+        report FAIL "/etc/apt/keyrings dir" "missing"
+    fi
+
+    # NodeSource signing key
+    if [[ -s "$keyring" ]]; then
+        report PASS "nodesource keyring" "$keyring"
+    else
+        report FAIL "nodesource keyring" "missing $keyring"
+    fi
+
+    # NodeSource APT sources list pinned to the requested major
+    arch="$(dpkg --print-architecture 2>/dev/null || echo unknown)"
+    expected_repo_line="deb [arch=${arch} signed-by=${keyring}] https://deb.nodesource.com/node_${node_major}.x nodistro main"
+    if [[ -f "$listfile" ]] && grep -Fxq "$expected_repo_line" "$listfile"; then
+        report PASS "nodesource sources list" "pinned to ${node_major}.x"
+    else
+        report FAIL "nodesource sources list" "missing or wrong major in $listfile"
+    fi
+
+    # Stale NodeSource lists for OTHER majors must not be present
+    shopt -s nullglob
+    stale_found=""
+    for f in /etc/apt/sources.list.d/nodesource*.list; do
+        if grep -q '^deb .*deb\.nodesource\.com/node_' "$f" 2>/dev/null \
+           && ! grep -Fxq "$expected_repo_line" "$f"; then
+            stale_found="$f"
+            break
+        fi
+    done
+    shopt -u nullglob
+    if [[ -z "$stale_found" ]]; then
+        report PASS "no stale nodesource lists" "ok"
+    else
+        report FAIL "no stale nodesource lists" "found $stale_found"
+    fi
+
+    # APT pin for nodejs
+    if [[ -f "$prefsfile" ]] \
+       && grep -q "^Package: nodejs" "$prefsfile" \
+       && grep -q "^Pin: version ${node_major}\\.\\*" "$prefsfile"; then
+        report PASS "apt pin for nodejs" "$prefsfile pins ${node_major}.x"
+    else
+        report FAIL "apt pin for nodejs" "missing or wrong in $prefsfile"
+    fi
+
+    # nodejs package installed
+    if dpkg-query -W -f='${Status}' nodejs 2>/dev/null | grep -q "install ok installed"; then
+        report PASS "package nodejs" "installed"
+    else
+        report FAIL "package nodejs" "missing"
+    fi
+
+    # node and npm binaries on PATH
+    for cmd in node npm; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            report PASS "binary $cmd" "$(command -v "$cmd")"
+        else
+            report FAIL "binary $cmd" "missing"
+        fi
+    done
+
+    # Installed major matches requested
+    if command -v node >/dev/null 2>&1; then
+        nv="$(node --version 2>/dev/null)"
+        installed_major="${nv#v}"
+        installed_major="${installed_major%%.*}"
+        if [[ "$installed_major" == "$node_major" ]]; then
+            report PASS "node major matches"  "$nv (major $installed_major)"
+        else
+            report FAIL "node major matches"  "got '$nv' (major $installed_major), want $node_major"
+        fi
+    else
+        report FAIL "node major matches"      "node not installed"
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        report PASS "npm version readable"    "$(npm --version 2>/dev/null || echo error)"
+    else
+        report FAIL "npm version readable"    "npm not installed"
+    fi
+
+    echo ""
+    echo "Summary: $pass PASS / $fail FAIL"
+    if [[ "$fail" -gt 0 ]]; then
+        echo "DRIFT DETECTED. Re-run without --check to reconcile."
+        exit 2
+    fi
+    echo "All applicable settings already configured."
+    exit 0
+fi
 
 # -------------------------------
 # 1. Install prerequisites
@@ -151,12 +313,37 @@ echo "[3/4] Configuring NodeSource APT repository for Node.js $node_major..."
 arch="$(dpkg --print-architecture)"
 repo_line="deb [arch=${arch} signed-by=${keyring}] https://deb.nodesource.com/node_${node_major}.x nodistro main"
 
+# Remove any stale NodeSource list files for OTHER major versions so APT
+# does not silently prefer a higher line (e.g. an older 24.x list left
+# over from a previous install would outrank our pinned 22.x).
+shopt -s nullglob
+for stale in /etc/apt/sources.list.d/nodesource*.list; do
+    if [[ "$stale" != "$listfile" ]] || ! grep -Fxq "$repo_line" "$stale" 2>/dev/null; then
+        if grep -q '^deb .*deb\.nodesource\.com/node_' "$stale" 2>/dev/null \
+           && ! grep -Fxq "$repo_line" "$stale"; then
+            echo "Removing stale NodeSource list: $stale"
+            rm -f "$stale"
+        fi
+    fi
+done
+shopt -u nullglob
+
 if ! grep -Fxq "$repo_line" "$listfile" 2>/dev/null; then
     echo "$repo_line" > "$listfile"
     echo "NodeSource APT repo written to $listfile."
 else
     echo "NodeSource APT repo already configured."
 fi
+
+# Pin nodejs to the requested major so APT can never pick a higher line,
+# even if another nodesource list is somehow re-introduced later.
+cat > "$prefsfile" <<EOF
+# Managed by install-nodejs.sh -- pin nodejs to the ${node_major}.x line.
+Package: nodejs
+Pin: version ${node_major}.*
+Pin-Priority: 1001
+EOF
+chmod 0644 "$prefsfile"
 
 if ! apt-get update; then
     echo "ERROR: apt-get update failed after adding NodeSource repo."
@@ -165,7 +352,9 @@ fi
 
 # The NodeSource `nodejs` package bundles npm. Do NOT install the
 # Ubuntu `npm` package alongside it -- they conflict.
-if ! apt-get install -y nodejs; then
+# --allow-downgrades lets us move from a higher major (e.g. 24.x left
+# over from a previous install) down to the requested $node_major.
+if ! apt-get install -y --allow-downgrades nodejs; then
     echo "ERROR: Failed to install nodejs from NodeSource."
     exit 1
 fi
@@ -201,7 +390,11 @@ echo "npm  --version : $npm_version"
 installed_major="${node_version#v}"
 installed_major="${installed_major%%.*}"
 if [[ "$installed_major" != "$node_major" ]]; then
-    echo "WARNING: Installed Node.js major ($installed_major) does not match requested ($node_major)."
+    echo "ERROR: Installed Node.js major ($installed_major) does not match requested ($node_major)."
+    echo "       Inspect leftover NodeSource sources:"
+    echo "         ls /etc/apt/sources.list.d/nodesource*.list"
+    echo "         apt-cache policy nodejs"
+    exit 1
 fi
 
 echo ""
