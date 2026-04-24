@@ -401,6 +401,11 @@ if [[ "$mode" == "check" ]]; then
         else
             report FAIL "bos-readahead.service" "not enabled"
         fi
+        if [[ -x /usr/local/sbin/bos-readahead-apply ]]; then
+            report PASS "bos-readahead helper" "/usr/local/sbin/bos-readahead-apply"
+        else
+            report FAIL "bos-readahead helper" "missing /usr/local/sbin/bos-readahead-apply"
+        fi
     fi
 
     # I/O scheduler udev rule
@@ -409,6 +414,17 @@ if [[ "$mode" == "check" ]]; then
         report PASS "I/O scheduler udev rule" "current=$cur_sched"
     else
         report FAIL "I/O scheduler udev rule" "missing $ioschedrule"
+    fi
+
+    # bfq module auto-load (only when the rule asks for bfq)
+    if grep -q 'ATTR{queue/scheduler}="bfq"' "$ioschedrule" 2>/dev/null; then
+        if [[ -f /etc/modules-load.d/bfq.conf ]] && grep -qx 'bfq' /etc/modules-load.d/bfq.conf; then
+            report PASS "bfq module auto-load" "/etc/modules-load.d/bfq.conf"
+        else
+            report FAIL "bfq module auto-load" "missing /etc/modules-load.d/bfq.conf"
+        fi
+    else
+        report SKIP "bfq module auto-load" "not using bfq"
     fi
 
     # fstrim.timer (SSD/flash only)
@@ -552,6 +568,37 @@ done
 
 if [[ "${#ra_targets[@]}" -gt 1 ]]; then
     # Persist dm/LV read-ahead across reboots via a tiny systemd oneshot.
+    # The targets are recomputed at boot by a helper script so the unit keeps
+    # working if the LV moves to a different PV, the disk is reinitialized,
+    # or the block-device tree changes after a kernel/LVM upgrade.
+    helper="/usr/local/sbin/bos-readahead-apply"
+    cat > "$helper" <<EOF
+#!/bin/bash
+# Managed by bos-scripts-collection / configure-usb-boot-optimization.sh
+# Re-applies read-ahead at boot to whatever block devices currently back '/'.
+set -u
+readahead=$readahead
+
+rootsrc="\$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+[[ -z "\$rootsrc" ]] && exit 0
+
+# Collect the root source plus every physical disk underneath it.
+targets=("\$rootsrc")
+while IFS= read -r d; do
+    [[ -n "\$d" && -b "\$d" ]] && targets+=("\$d")
+done < <(lsblk -s -l -no NAME,TYPE "\$rootsrc" 2>/dev/null \\
+         | awk '\$2 == "disk" {print "/dev/" \$1}' \\
+         | sort -u)
+
+rc=0
+for t in "\${targets[@]}"; do
+    [[ -b "\$t" ]] || continue
+    /sbin/blockdev --setra "\$readahead" "\$t" || rc=\$?
+done
+exit \$rc
+EOF
+    chmod 0755 "$helper"
+
     cat > /etc/systemd/system/bos-readahead.service <<EOF
 # Managed by bos-scripts-collection / configure-usb-boot-optimization.sh
 [Unit]
@@ -560,7 +607,7 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/blockdev --setra $readahead ${ra_targets[*]}
+ExecStart=$helper
 RemainAfterExit=yes
 
 [Install]
@@ -642,6 +689,20 @@ EOF
         echo "I/O scheduler set to '$iosched' on $devbase (persisted via udev)."
     else
         echo "WARNING: could not write scheduler live; udev rule will apply on reboot."
+    fi
+
+    # If we picked bfq, make sure the module is auto-loaded at boot. The udev
+    # rule's ATTR{queue/scheduler}="bfq" will silently fall back to whatever
+    # scheduler is active when bfq.ko isn't loaded yet, so this guarantees
+    # the module is present before udev fires.
+    if [[ "$iosched" == "bfq" ]]; then
+        modlist="/etc/modules-load.d/bfq.conf"
+        if [[ -f "$modlist" ]] && grep -qx "bfq" "$modlist"; then
+            : # already pinned
+        else
+            echo "bfq" > "$modlist"
+            echo "Pinned 'bfq' kernel module via $modlist."
+        fi
     fi
 fi
 
